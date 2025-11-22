@@ -11,35 +11,32 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset, random_split
 from torchvision import datasets, transforms
 
-from models.mnist_cnn import CentralizedMNISTCNN
+from models.mnist_cnn import CentralizedMNISTCNN   # IMPORTANT: must match file
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # -----------------------------
-# Hyperparameters
+# Hyperparameters (LEVEL-2 REQUIRED)
 # -----------------------------
-NUM_CLIENTS = 10
-ROUNDS = 10           # number of communication rounds
-LOCAL_EPOCHS = 1      # local epochs per round
+NUM_CLIENTS = 10          # as required by professor
+ROUNDS = 10               # communication rounds
+LOCAL_EPOCHS = 1          # each client trains 1 epoch per round
 BATCH_SIZE = 64
 LR = 1e-3
+WEIGHT_DECAY = 1e-4       # robust generalization
 MODEL_SAVE_PATH = "federated_global_mnist_cnn.pt"
 
 
 # -----------------------------
-# Dataset & Federated Split
+# Federated Dataset Split
 # -----------------------------
-def get_federated_dataloaders(
-    num_clients: int,
-    batch_size: int
-) -> Tuple[List[DataLoader], DataLoader]:
+def get_federated_dataloaders(num_clients: int, batch_size: int):
     """
-    For now: create federated split by partitioning the standard MNIST train set
-    into `num_clients` disjoint subsets.
+    Splits MNIST training set into num_clients disjoint partitions.
+    Each partition = 1 client.
+    """
 
-    Later: you can replace this function with the instructor's provided
-    federated dataloader while keeping the rest of the FL logic unchanged.
-    """
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
@@ -59,81 +56,64 @@ def get_federated_dataloaders(
         transform=transform
     )
 
-    # Split train_dataset indices into num_clients parts
     n = len(train_dataset)
     lengths = [n // num_clients] * num_clients
     for i in range(n % num_clients):
         lengths[i] += 1
 
-    subsets: List[Subset] = list(random_split(train_dataset, lengths))
+    subsets = random_split(train_dataset, lengths)
 
-    client_loaders: List[DataLoader] = []
-    for subset in subsets:
-        loader = DataLoader(
-            subset,
-            batch_size=batch_size,
-            shuffle=True
-        )
-        client_loaders.append(loader)
+    client_loaders = [
+        DataLoader(subset, batch_size=batch_size, shuffle=True)
+        for subset in subsets
+    ]
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False
-    )
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     return client_loaders, test_loader
 
 
 # -----------------------------
-# Local client update
+# Local Training on Client
 # -----------------------------
-def client_update(
-    model: nn.Module,
-    train_loader: DataLoader,
-    epochs: int,
-    lr: float
-) -> Tuple[nn.Module, int]:
+def client_update(model, train_loader, epochs, lr, weight_decay):
     """
-    Train a copy of the global model on a single client's data.
-    Returns the updated model and number of samples used.
+    Each client trains a *copy* of the global model.
     """
     model = copy.deepcopy(model)
     model.to(device)
     model.train()
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     num_samples = 0
 
     for _ in range(epochs):
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
+
             optimizer.zero_grad()
             out = model(x)
             loss = criterion(out, y)
             loss.backward()
             optimizer.step()
+
             num_samples += y.size(0)
 
     return model, num_samples
 
 
 # -----------------------------
-# Server-side aggregation (FedAvg)
+# FedAvg Server Aggregation
 # -----------------------------
-def fed_avg(
-    global_model: nn.Module,
-    client_models: List[nn.Module],
-    client_sizes: List[int]
-) -> nn.Module:
+def fed_avg(global_model, client_models, client_sizes):
     """
-    global_param = sum_k (n_k / N) * param_k
+    Classic FedAvg:
+        w_global = Σ (n_k / N_total) * w_k
     """
     global_dict = global_model.state_dict()
 
-    # initialize with zeros
     for key in global_dict.keys():
         global_dict[key] = torch.zeros_like(global_dict[key])
 
@@ -153,12 +133,12 @@ def fed_avg(
 # Evaluation
 # -----------------------------
 @torch.no_grad()
-def evaluate(model: nn.Module, test_loader: DataLoader) -> Tuple[float, float]:
+def evaluate(model, test_loader):
     model.eval()
     model.to(device)
 
     criterion = nn.CrossEntropyLoss()
-    total_loss = 0.0
+    total_loss = 0
     correct = 0
     total = 0
 
@@ -169,54 +149,60 @@ def evaluate(model: nn.Module, test_loader: DataLoader) -> Tuple[float, float]:
 
         total_loss += loss.item() * y.size(0)
         _, pred = out.max(1)
-        total += y.size(0)
         correct += pred.eq(y).sum().item()
+        total += y.size(0)
 
     avg_loss = total_loss / total
-    acc = 100.0 * correct / total
+    acc = 100 * correct / total
     return avg_loss, acc
 
 
 # -----------------------------
-# Main federated training loop
+# Main Federated Training Loop
 # -----------------------------
 def main():
+
+    print("Preparing federated dataloaders (10 clients)...")
     client_loaders, test_loader = get_federated_dataloaders(NUM_CLIENTS, BATCH_SIZE)
 
+    print("Initializing global model...\n")
     global_model = CentralizedMNISTCNN().to(device)
-    best_acc = 0.0
+
+    best_acc = 0
 
     for round_idx in range(1, ROUNDS + 1):
-        print(f"\n--- Round {round_idx}/{ROUNDS} ---")
+        print(f"\n==================== Round {round_idx}/{ROUNDS} ====================")
 
         client_models = []
         client_sizes = []
 
-        # each client trains locally
+        # ---- CLIENT TRAINING ----
         for client_id, train_loader in enumerate(client_loaders):
             local_model, n_k = client_update(
                 global_model,
                 train_loader,
                 epochs=LOCAL_EPOCHS,
-                lr=LR
+                lr=LR,
+                weight_decay=WEIGHT_DECAY
             )
             client_models.append(local_model)
             client_sizes.append(n_k)
-            print(f" Client {client_id}: trained on {n_k} samples")
+            print(f" Client {client_id} finished training on {n_k} samples")
 
-        # server aggregates
+        # ---- SERVER AGGREGATION ----
         global_model = fed_avg(global_model, client_models, client_sizes)
 
-        # evaluate global model
-        test_loss, test_acc = evaluate(global_model, test_loader)
-        print(f" Round {round_idx}: Test Loss = {test_loss:.4f}, Test Acc = {test_acc:.2f}%")
+        # ---- EVALUATE GLOBAL MODEL ----
+        loss, acc = evaluate(global_model, test_loader)
+        print(f" Round {round_idx}: Test Loss = {loss:.4f}, Test Acc = {acc:.2f}%")
 
-        if test_acc > best_acc:
-            best_acc = test_acc
+        # Save best model
+        if acc > best_acc:
+            best_acc = acc
             torch.save(global_model.state_dict(), MODEL_SAVE_PATH)
-            print(f"  New best global model saved with acc = {best_acc:.2f}%")
+            print(f"  >>> Best model updated! New Accuracy = {best_acc:.2f}%")
 
-    print(f"\nTraining finished. Best Global Test Accuracy: {best_acc:.2f}%")
+    print(f"\nTraining Finished! Best Global Accuracy: {best_acc:.2f}%")
 
 
 if __name__ == "__main__":

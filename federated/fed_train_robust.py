@@ -1,8 +1,11 @@
+# federated/fed_train_robust.py
+
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import copy
+import random
 from typing import List, Tuple
 
 import torch
@@ -15,12 +18,19 @@ from models.mnist_cnn import CentralizedMNISTCNN
 
 
 # -----------------------------
-# Device
+# Device and seed
 # -----------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
 # -----------------------------
-# Hyperparameters (LEVEL 3)
+# Hyperparameters (Level 3)
 # -----------------------------
 NUM_CLIENTS = 10
 ROUNDS = 10
@@ -30,15 +40,15 @@ LR = 1e-3
 WEIGHT_DECAY = 1e-4
 MODEL_SAVE_PATH = "federated_global_mnist_cnn_robust.pt"
 
-# Attack configuration
-ATTACKER_ID = 0              # which client is malicious
-ENABLE_ATTACK = True         # turn attack on/off
-ATTACK_TYPE = "scaling"      # "scaling" or "random"
-ATTACK_SCALE = 10.0          # factor for scaling attack
+# Attack config (generic, works for any underlying data)
+ATTACKER_ID = 0             # malicious client index
+ENABLE_ATTACK = True
+ATTACK_TYPE = "scaling"     # "scaling" or "random"
+ATTACK_SCALE = 10.0
 
-# Defense configuration
+# Detection config
 ENABLE_DETECTION = True
-NORM_THRESHOLD_MULTIPLIER = 3.0   # > median_norm * this => suspicious
+NORM_THRESHOLD_MULTIPLIER = 3.0   # norm > median_norm * this => suspicious
 
 
 # -----------------------------
@@ -46,25 +56,26 @@ NORM_THRESHOLD_MULTIPLIER = 3.0   # > median_norm * this => suspicious
 # -----------------------------
 def get_federated_dataloaders(num_clients: int, batch_size: int):
     """
-    Split MNIST train set into `num_clients` disjoint subsets (one per client).
+    Same pattern as Level 2; dataset is centralized but training is simulated across clients.
+    To adapt to another handwritten dataset, replace the datasets.MNIST part.
     """
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
+        transforms.Normalize((0.1307,), (0.3081,)),
     ])
 
     train_dataset = datasets.MNIST(
         root="./data",
         train=True,
         download=True,
-        transform=transform
+        transform=transform,
     )
 
     test_dataset = datasets.MNIST(
         root="./data",
         train=False,
         download=True,
-        transform=transform
+        transform=transform,
     )
 
     n = len(train_dataset)
@@ -85,18 +96,19 @@ def get_federated_dataloaders(num_clients: int, batch_size: int):
 
 
 # -----------------------------
-# Local client training
+# Local client update
 # -----------------------------
 def client_update(model, train_loader, epochs, lr, weight_decay):
-    """
-    Train a copy of the global model on a single client's local data.
-    """
     model = copy.deepcopy(model)
     model.to(device)
     model.train()
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
 
     num_samples = 0
 
@@ -116,17 +128,17 @@ def client_update(model, train_loader, epochs, lr, weight_decay):
 
 
 # -----------------------------
-# Attack simulation
+# Attack injection
 # -----------------------------
 def apply_attack(global_model, local_model):
     """
-    Modify the local_model to simulate a malicious client update.
+    Generic malicious update: either scaled update or random weights.
+    This does NOT depend on the underlying dataset, only on model parameters.
     """
     if not ENABLE_ATTACK:
         return local_model
 
     if ATTACK_TYPE == "scaling":
-        # Scale the update relative to global weights
         global_state = global_model.state_dict()
         local_state = local_model.state_dict()
         attacked_state = {}
@@ -139,7 +151,6 @@ def apply_attack(global_model, local_model):
         return local_model
 
     elif ATTACK_TYPE == "random":
-        # Replace weights with random noise
         local_state = local_model.state_dict()
         for key in local_state.keys():
             noise = torch.randn_like(local_state[key])
@@ -147,17 +158,13 @@ def apply_attack(global_model, local_model):
         local_model.load_state_dict(local_state)
         return local_model
 
-    # no-op if unknown type
     return local_model
 
 
 # -----------------------------
-# Utility: compute update norm
+# Compute update norm
 # -----------------------------
 def compute_update_norm(global_model, client_model) -> float:
-    """
-    Compute L2 norm of client's update (difference from global model).
-    """
     g_state = global_model.state_dict()
     c_state = client_model.state_dict()
     sq_sum = 0.0
@@ -170,21 +177,14 @@ def compute_update_norm(global_model, client_model) -> float:
 
 
 # -----------------------------
-# Standard FedAvg
+# Safe FedAvg (float-only)
 # -----------------------------
 def fed_avg(global_model, client_models, client_sizes):
-    """
-    FedAvg that ignores non-floating-point parameters.
-    Some parameters (e.g., BatchNorm counters) are int64 and should NOT be averaged.
-    """
     global_dict = global_model.state_dict()
 
-    # initialize aggregation buffers
     for key in global_dict.keys():
-        # Only aggregate float/half parameters
-        if global_dict[key].dtype in [torch.float32, torch.float64, torch.float16]:
+        if global_dict[key].dtype in (torch.float16, torch.float32, torch.float64):
             global_dict[key] = torch.zeros_like(global_dict[key])
-        # Otherwise leave them as-is (keep global values)
         else:
             global_dict[key] = global_dict[key]
 
@@ -195,24 +195,18 @@ def fed_avg(global_model, client_models, client_sizes):
         weight = n_k / total_samples
 
         for key in global_dict.keys():
-            # Only aggregate floating-point tensors
-            if global_dict[key].dtype in [torch.float32, torch.float64, torch.float16]:
+            if global_dict[key].dtype in (torch.float16, torch.float32, torch.float64):
                 global_dict[key] += client_state[key] * weight
 
     global_model.load_state_dict(global_dict)
     return global_model
 
 
-
 # -----------------------------
 # Robust aggregation with detection
 # -----------------------------
 def robust_fed_avg(global_model, client_models, client_sizes):
-    """
-    Detect suspicious clients based on update norm, and aggregate only benign ones.
-    """
     if not ENABLE_DETECTION:
-        # No detection, just FedAvg
         return fed_avg(global_model, client_models, client_sizes), list(range(len(client_models)))
 
     norms = [compute_update_norm(global_model, cm) for cm in client_models]
@@ -228,7 +222,6 @@ def robust_fed_avg(global_model, client_models, client_sizes):
         else:
             benign_indices.append(idx)
 
-    # If everything is flagged suspicious by mistake, fall back to using all
     if len(benign_indices) == 0:
         benign_indices = list(range(len(client_models)))
         suspicious_indices = []
@@ -269,9 +262,11 @@ def evaluate(model, test_loader):
 
 
 # -----------------------------
-# Main: Robust Federated Training
+# Main robust FL loop
 # -----------------------------
 def main():
+    set_seed(42)
+    print("Using device:", device)
     print("Preparing federated dataloaders (10 clients)...")
     client_loaders, test_loader = get_federated_dataloaders(NUM_CLIENTS, BATCH_SIZE)
 
@@ -286,17 +281,16 @@ def main():
         client_models = []
         client_sizes = []
 
-        # ----- Local training -----
         for client_id, train_loader in enumerate(client_loaders):
             local_model, n_k = client_update(
                 global_model,
                 train_loader,
                 epochs=LOCAL_EPOCHS,
                 lr=LR,
-                weight_decay=WEIGHT_DECAY
+                weight_decay=WEIGHT_DECAY,
             )
 
-            # Simulate attack on attacker client
+            # Inject attack for the attacker client
             if ENABLE_ATTACK and client_id == ATTACKER_ID:
                 print(f"  >> Applying ATTACK ({ATTACK_TYPE}) to client {client_id}")
                 local_model = apply_attack(global_model, local_model)
@@ -305,10 +299,10 @@ def main():
             client_sizes.append(n_k)
             print(f"  Client {client_id}: trained on {n_k} samples")
 
-        # ----- Robust aggregation with detection -----
-        global_model, benign_indices = robust_fed_avg(global_model, client_models, client_sizes)
+        # Robust aggregation
+        global_model, _ = robust_fed_avg(global_model, client_models, client_sizes)
 
-        # ----- Evaluate global model -----
+        # Evaluate robust global model
         test_loss, test_acc = evaluate(global_model, test_loader)
         print(f"  Round {round_idx}: Test Loss = {test_loss:.4f}, Test Acc = {test_acc:.2f}%")
 

@@ -1,5 +1,9 @@
 # centralized/train_centralized.py
 
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import random
 
 import torch
@@ -20,8 +24,8 @@ def set_seed(seed: int = 42):
 def get_dataloaders(batch_size: int = 64):
     """
     Centralized train/test loaders.
-    Currently uses MNIST, but you can swap this for any handwritten dataset
-    with the same (or adapted) transforms.
+    Uses MNIST right now but can be swapped for any handwritten dataset
+    (just change the datasets.MNIST lines).
     """
     normalize = transforms.Normalize((0.1307,), (0.3081,))
 
@@ -131,7 +135,7 @@ def main():
     )
 
     best_acc = 0.0
-    num_epochs = 10  # fixed for assignment / runtime
+    num_epochs = 10  # keep at 10 for fast, consistent runs
 
     for epoch in range(1, num_epochs + 1):
         train_one_epoch(model, train_loader, criterion, optimizer, device, epoch)

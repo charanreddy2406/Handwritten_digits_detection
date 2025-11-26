@@ -1,17 +1,9 @@
-# Python virtual environments
-.venv/
-venv/
-
-# Python cache
 __pycache__/
 *.pyc
-
-# macOS
-.DS_Store
-
-# Data & models (keep local, don't push)
-data/
 *.pt
-
-# VS Code settings (optional)
+.venv/
+data/
+gan_eval_images/
+gan_labeled/
 .vscode/
+.DS_Store
